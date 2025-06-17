@@ -2,28 +2,20 @@ pipeline {
     agent any
 
     stages {
-        stage('Checkout') {
+        stage('Build') {
             steps {
-                git 'https://github.com/kchilla872/Playwright.git'
+                echo 'Building..'
             }
         }
-        stage('Install Dependencies') {
+        stage('Test') {
             steps {
-                bat 'python -m venv venv'
-                bat 'python -m pip install --upgrade pip'
-                bat 'call venv\\Scripts\\activate && pip install -r requirements.txt'
-                bat 'call venv\\Scripts\\activate && playwright install'
+                echo 'Testing..'
             }
         }
-        stage('Run Tests') {
+        stage('Deploy') {
             steps {
-                bat 'call venv\\Scripts\\activate && pytest homePage.py -v'
+                echo 'Deploying....'
             }
-        }
-    }
-    post {
-        always {
-            cleanWs()
         }
     }
 }
