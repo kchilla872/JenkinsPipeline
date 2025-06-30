@@ -1,0 +1,154 @@
+import pytest
+import os
+import json
+import shutil
+import allure
+from pathlib import Path
+from playwright.sync_api import Playwright
+
+
+def pytest_addoption(parser):
+    parser.addoption("--hidden", action='store_true', default=False)
+    parser.addoption("--runZap", action='store_true', default=False)
+    parser.addoption("--add_video", action='store_true', default=False)
+    parser.addoption(
+        "--custom-browser",
+        action='store',
+        default="chromium",
+        help="Browser to run tests on: chromium, chrome, firefox, webkit"
+    )
+
+
+def pytest_configure(config):
+    """Configure pytest for parallel browser execution"""
+    if not hasattr(config, 'workerinput'):
+        custom_browser = config.getoption("custom_browser")
+        if custom_browser:
+            config._browser_queue = [custom_browser]
+        else:
+            config._browser_queue = ['chromium', 'firefox', 'webkit', 'chrome']
+
+
+def pytest_configure_node(node):
+    """Configure each worker node with a specific browser"""
+    if hasattr(node.config, '_browser_queue') and node.config._browser_queue:
+        browser = node.config._browser_queue.pop(0)
+        node.workerinput['browser'] = browser
+        print(f"🌐 Worker {node.gateway.id if hasattr(node, 'gateway') else 'main'} assigned browser: {browser}")
+
+@pytest.fixture(scope="session")
+def browser_name(request):
+    """Get browser name for current worker"""
+    if hasattr(request.config, 'workerinput'):
+        return request.config.workerinput.get('browser', 'chromium')
+    else:
+        return request.config.getoption("custom_browser")
+
+
+@pytest.fixture(scope="function")
+def browser(playwright: Playwright, request, browser_name):
+    """Launch browser based on worker assignment"""
+    hidden = request.config.getoption("hidden")
+    runZap = request.config.getoption("runZap")
+    launch_args = ['--no-sandbox', '--disable-setuid-sandbox']
+
+    if runZap:
+        launch_args.append('--ignore-certificate-errors')
+    proxy = {"server": 'localhost:8080'} if runZap else None
+
+    print(f"🚀 Launching {browser_name} browser...")
+
+    if browser_name == "chrome":
+        chrome_path = shutil.which("chrome") or shutil.which("google-chrome") or r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+        if not os.path.exists(chrome_path):
+            raise Exception(f"Chrome not found at {chrome_path}. Add it to PATH or check path.")
+        browser = playwright.chromium.launch(
+            headless=hidden,
+            args=launch_args,
+            executable_path=chrome_path,
+            proxy=proxy
+        )
+    elif browser_name == "firefox":
+        browser = playwright.firefox.launch(
+            headless=hidden,
+            args=launch_args,
+            proxy=proxy
+        )
+    elif browser_name == "webkit":
+        browser = playwright.webkit.launch(
+            headless=hidden,
+            args=launch_args,
+            proxy=proxy
+        )
+    else:  # chromium (default)
+        browser = playwright.chromium.launch(
+            headless=hidden,
+            args=launch_args,
+            proxy=proxy
+        )
+
+    yield browser
+    browser.close()
+
+
+@pytest.fixture(scope="function")
+def page(browser, request, browser_name):
+    """Create page with browser-specific configuration and enable tracing."""
+    storage_path = f"test_{browser_name}.json"
+    add_video = request.config.getoption("add_video")
+
+    context_args = {}
+    if os.path.exists(storage_path):
+        try:
+            with open(storage_path, 'r') as f:
+                json.load(f)
+            context_args["storage_state"] = storage_path
+        except json.JSONDecodeError:
+            print(f"⚠️ Invalid JSON in {storage_path}. Ignoring.")
+
+    if add_video:
+        video_dir = f"videos/{browser_name}/"
+        os.makedirs(video_dir, exist_ok=True)
+        context_args["record_video_dir"] = video_dir
+
+    context = browser.new_context(**context_args)
+    # Start tracing before any actions
+    context.tracing.start(screenshots=True, snapshots=True, sources=True)
+    page = context.new_page()
+    page.set_default_timeout(60000)
+    page.goto("https://www.amazon.in")
+
+    yield page
+
+    # Stop tracing and save the trace (for every test)
+    trace_path = f"traces/{browser_name}/test_{request.node.name}.zip"
+    os.makedirs(os.path.dirname(trace_path), exist_ok=True)
+    context.tracing.stop(path=trace_path)
+    page.close()
+    context.close()
+
+
+@pytest.fixture(autouse=True)
+def add_browser_info(request, browser_name):
+    """Add browser information to test metadata"""
+    if hasattr(request.node, 'add_marker'):
+        request.node.add_marker(pytest.mark.browser(browser_name))
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Hook to take a screenshot for each test and attach it to Allure report."""
+    outcome = yield
+    report = outcome.get_result()
+    if report.when == "call":
+        if "page" in item.funcargs:
+            page = item.funcargs["page"]
+            screenshot_dir = Path("screenshots")
+            screenshot_dir.mkdir(exist_ok=True)
+            screenshot_path = screenshot_dir / f"{item.nodeid.replace('::', '_')}.png"
+            page.screenshot(path=screenshot_path)
+            allure.attach.file(
+                str(screenshot_path),
+                name="screenshot",
+                attachment_type=allure.attachment_type.PNG,
+            )
